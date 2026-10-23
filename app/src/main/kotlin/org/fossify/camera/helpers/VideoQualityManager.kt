@@ -26,10 +26,16 @@ class VideoQualityManager(
     fun initSupportedQualities(cameraProvider: ProcessCameraProvider) {
         if (videoQualities.isEmpty()) {
             for (camSelector in CAMERA_SELECTORS) {
-                cameraProvider.unbindAll()
-                val camera = cameraProvider.bindToLifecycle(activity, camSelector)
                 try {
-                    if (cameraProvider.hasCamera(camSelector)) {
+                    cameraProvider.unbindAll()
+                    // La clé reste DEFAULT_*_CAMERA ; pour l'arrière on ne lie que le capteur principal.
+                    val bindSelector = if (camSelector == CameraSelector.DEFAULT_BACK_CAMERA) {
+                        MainCameraResolver.backSelector(activity) ?: camSelector
+                    } else {
+                        camSelector
+                    }
+                    if (cameraProvider.hasCamera(bindSelector)) {
+                        val camera = cameraProvider.bindToLifecycle(activity, bindSelector)
                         QualitySelector.getSupportedQualities(camera.cameraInfo)
                             .filter(QUALITIES::contains)
                             .also { allQualities ->
@@ -43,6 +49,7 @@ class VideoQualityManager(
                             }
                     }
                 } catch (e: Exception) {
+                    CameraDiagnostics.log("QUALITIES_FAIL", "qualités vidéo ($camSelector) : ${e.javaClass.simpleName}", e)
                     activity.showErrorToast(e)
                 }
             }

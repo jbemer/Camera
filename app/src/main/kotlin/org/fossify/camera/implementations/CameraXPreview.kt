@@ -70,12 +70,14 @@ import org.fossify.camera.extensions.toCameraXFlashMode
 import org.fossify.camera.extensions.toCameraXQuality
 import org.fossify.camera.extensions.toLensFacing
 import org.fossify.camera.helpers.BitmapUtils
+import org.fossify.camera.helpers.CameraDiagnostics
 import org.fossify.camera.helpers.CameraErrorHandler
 import org.fossify.camera.helpers.FLASH_ALWAYS_ON
 import org.fossify.camera.helpers.FLASH_ON
 import org.fossify.camera.helpers.ImageQualityManager
 import org.fossify.camera.helpers.ImageSaver
 import org.fossify.camera.helpers.ImageUtil
+import org.fossify.camera.helpers.MainCameraResolver
 import org.fossify.camera.helpers.MediaOutputHelper
 import org.fossify.camera.helpers.MediaSizeStore
 import org.fossify.camera.helpers.MediaSoundHelper
@@ -191,16 +193,38 @@ class CameraXPreview(
     }
 
     private fun startCamera(switching: Boolean = false) {
+        if (CameraDiagnostics.RAW_OPEN_PROBE_ENABLED &&
+            !CameraDiagnostics.probeAlreadyRun &&
+            !isFrontCameraInUse()
+        ) {
+            CameraDiagnostics.probeAlreadyRun = true
+            val mainId = MainCameraResolver.resolve(activity)?.cameraId
+            if (mainId != null) {
+                // Ouverture Camera2 pure du capteur principal, puis démarrage normal de CameraX.
+                CameraDiagnostics.probeOpen(activity, mainId) { startCameraInternal(switching) }
+                return
+            }
+        }
+        startCameraInternal(switching)
+    }
+
+    private fun startCameraInternal(switching: Boolean) {
+        CameraDiagnostics.log("PROVIDER", "ProcessCameraProvider.getInstance() (switching=$switching)")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(activity.applicationContext)
         cameraProviderFuture.addListener({
+            var stage = "PROVIDER_FAIL"
             try {
                 val provider = cameraProviderFuture.get()
                 cameraProvider = provider
+                CameraDiagnostics.log("PROVIDER", "provider obtenu, caméras disponibles = ${provider.availableCameraInfos.size}")
+                stage = "QUALITIES_FAIL"
                 imageQualityManager.initSupportedQualities()
                 videoQualityManager.initSupportedQualities(provider)
+                stage = "BIND_FAIL"
                 bindCameraUseCases()
                 setupCameraObservers()
             } catch (e: Exception) {
+                CameraDiagnostics.log(stage, "échec : ${e.javaClass.simpleName}: ${e.message}", e)
                 val errorMessage =
                     if (switching) R.string.camera_switch_error else R.string.camera_open_error
                 activity.toast(errorMessage)
@@ -234,6 +258,12 @@ class CameraXPreview(
         val captureUseCase = getCaptureUseCase(targetResolution, rotation)
 
         cameraProvider.unbindAll()
+        val bindSelector = resolveBindSelector()
+        CameraDiagnostics.log(
+            "BIND",
+            "bindToLifecycle, face=${if (isFrontCameraInUse()) "avant" else "arrière"}, " +
+                "photo=$isPhotoCapture, cible=${targetResolution.width}x${targetResolution.height}"
+        )
         camera = if (isFullSize) {
             val metrics = windowMetricsCalculator.computeCurrentWindowMetrics(activity).bounds
             val screenWidth = metrics.width()
@@ -248,20 +278,30 @@ class CameraXPreview(
 
             cameraProvider.bindToLifecycle(
                 activity,
-                cameraSelector,
+                bindSelector,
                 useCaseGroup,
             )
         } else {
             cameraProvider.bindToLifecycle(
                 activity,
-                cameraSelector,
+                bindSelector,
                 previewUseCase,
                 captureUseCase,
             )
         }
+        CameraDiagnostics.describeBoundCamera(camera)
         preview = previewUseCase
         setupZoomAndFocus()
         setFlashlightState(config.flashlightState)
+    }
+
+    /**
+     * `cameraSelector` reste DEFAULT_BACK/FRONT_CAMERA : c'est la clé des tables de qualités.
+     * Pour la face arrière, on lie en réalité le seul capteur principal.
+     */
+    private fun resolveBindSelector(): CameraSelector {
+        if (isFrontCameraInUse()) return cameraSelector
+        return MainCameraResolver.backSelector(activity) ?: cameraSelector
     }
 
     private fun buildPreview(resolution: Size, rotation: Int): Preview {
@@ -346,6 +386,16 @@ class CameraXPreview(
             listener.onInitVideoMode()
         }
         camera?.cameraInfo?.cameraState?.observe(activity) { cameraState ->
+            val stateError = cameraState.error
+            if (stateError == null) {
+                CameraDiagnostics.log("STATE", "type=${cameraState.type}")
+            } else {
+                CameraDiagnostics.log(
+                    "STATE_ERROR",
+                    "type=${cameraState.type} code=${stateError.code} cause=${stateError.cause}",
+                    stateError.cause
+                )
+            }
             if (cameraState.error == null) {
                 when (cameraState.type) {
                     CameraState.Type.OPENING,

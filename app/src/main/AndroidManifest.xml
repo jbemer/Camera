@@ -35,7 +35,7 @@
         tools:node="remove" />
 
     <application
-        android:name="org.fossify.commons.FossifyApp"
+        android:name=".CameraApp"
         android:allowBackup="true"
         android:appCategory="image"
         android:icon="@mipmap/ic_launcher"

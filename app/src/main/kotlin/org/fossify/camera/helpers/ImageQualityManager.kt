@@ -24,8 +24,16 @@ class ImageQualityManager(private val activity: AppCompatActivity) {
 
     fun initSupportedQualities() {
         if (imageQualities.isEmpty()) {
+            val mainChoice = MainCameraResolver.resolve(activity)
             for (cameraId in cameraManager.cameraIdList) {
                 try {
+                    // Ne pas relire ni agréger les autres capteurs dorsaux (ultra grand-angle, télé…).
+                    if (mainChoice != null &&
+                        cameraId != mainChoice.cameraId &&
+                        cameraId in mainChoice.allBackIds
+                    ) {
+                        continue
+                    }
                     val characteristics = cameraManager.getCameraCharacteristics(cameraId)
                     val lensFacing =
                         characteristics.get(CameraCharacteristics.LENS_FACING) ?: continue
@@ -45,6 +53,7 @@ class ImageQualityManager(private val activity: AppCompatActivity) {
                         imageQualities.add(CameraSelectorImageQualities(cameraSelector, imageSizes))
                     }
                 } catch (e: Exception) {
+                    CameraDiagnostics.log("QUALITIES_FAIL", "tailles photo id=$cameraId : ${e.javaClass.simpleName}", e)
                     activity.showErrorToast(e)
                 }
             }
