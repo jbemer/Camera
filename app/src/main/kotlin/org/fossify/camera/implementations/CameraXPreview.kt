@@ -20,6 +20,9 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraState
 import androidx.camera.core.DisplayOrientedMeteringPointFactory
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.ExtendableBuilder
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCapture.Builder
 import androidx.camera.core.ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
@@ -298,13 +301,26 @@ class CameraXPreview(
         return MainCameraResolver.backSelector(activity) ?: cameraSelector
     }
 
+    /**
+     * Impose le capteur physique principal à TOUS les flux (aperçu, photo, vidéo) : CameraX ne le
+     * fait seul que pour l'aperçu, et un seul flux logique suffit à démarrer le pipeline qui plante.
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun <T> applyPhysicalCamera(builder: ExtendableBuilder<T>) {
+        val id = MainCameraResolver.physicalOverride ?: return
+        if (isFrontCameraInUse()) return
+        CameraDiagnostics.log("BIND", "flux imposé au capteur physique $id")
+        Camera2Interop.Extender(builder).setPhysicalCameraId(id)
+    }
+
     private fun buildPreview(resolution: Size, rotation: Int): Preview {
-        return Preview.Builder()
+        val builder = Preview.Builder()
             .setTargetRotation(rotation)
             .setResolutionSelector(getResolutionSelector(resolution))
-            .build().apply {
-                setSurfaceProvider(previewView.surfaceProvider)
-            }
+        applyPhysicalCamera(builder)
+        return builder.build().apply {
+            setSurfaceProvider(previewView.surfaceProvider)
+        }
     }
 
     private fun getCaptureUseCase(resolution: Size, rotation: Int): UseCase {
@@ -322,13 +338,14 @@ class CameraXPreview(
     }
 
     private fun buildImageCapture(resolution: Size, rotation: Int): ImageCapture {
-        return Builder()
+        val builder = Builder()
             .setCaptureMode(getCaptureMode())
             .setFlashMode(flashMode)
             .setJpegQuality(config.photoQuality)
             .setTargetRotation(rotation)
             .setResolutionSelector(getResolutionSelector(resolution))
-            .build()
+        applyPhysicalCamera(builder)
+        return builder.build()
     }
 
     private fun getCaptureMode(): Int {
@@ -368,7 +385,9 @@ class CameraXPreview(
             .setQualitySelector(qualitySelector)
             .build()
 
-        return VideoCapture.withOutput(recorder)
+        val builder = VideoCapture.Builder(recorder)
+        applyPhysicalCamera(builder)
+        return builder.build()
     }
 
     private fun setupCameraObservers() {

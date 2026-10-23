@@ -189,7 +189,6 @@ object MainCameraResolver {
                     match
                 }
             })
-        physicalOverride?.let { builder.setPhysicalCameraId(it) }
         val selector = builder.build()
         cachedSelector = selector
         return selector

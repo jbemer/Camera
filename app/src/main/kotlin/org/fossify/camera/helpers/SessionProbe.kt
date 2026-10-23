@@ -2,7 +2,10 @@ package org.fossify.camera.helpers
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.SharedPreferences
 import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
+import android.hardware.HardwareBuffer
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -27,16 +30,18 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 
 /**
- * Test Camera2 pur (sans CameraX) du capteur dorsal principal, une seule fois (résultat mémorisé) :
- *   1. session sur la caméra logique, flux logique par défaut ;
- *   2. session sur la caméra logique avec un flux demandé à UN capteur physique caché (ex. 5, 6).
- * Chaque test compte les images reçues pendant ~2 s. Le résultat décide si CameraX doit demander
- * un ID physique (CameraSelector.Builder.setPhysicalCameraId).
- * Résultat mémorisé dans les préférences ; effacer les données de l'app pour refaire le test.
+ * Tests Camera2 purs (sans CameraX), exécutés une seule fois (résultat mémorisé).
+ *
+ * Phase 1 : flux YUV 640x480 sur la caméra logique, puis sur chaque capteur physique caché.
+ * Phase 2 (si un capteur physique fonctionne) : combinaisons proches de CameraX
+ *           (YUV + JPEG pleine taille, puis aperçu PRIVATE + JPEG pleine taille).
+ *
+ * Le capteur physique retenu en phase 1 est imposé à CameraX (voir CameraXPreview).
+ * Effacer les données de l'app pour refaire les tests.
  */
 object SessionProbe {
     private const val PREFS = "camera_diag_prefs"
-    private const val KEY_RESULT = "probe_result_v2"
+    private const val KEY_RESULT = "probe_result_v3"
     private const val MIN_FRAMES = 3
 
     private enum class State { IDLE, RUNNING, DONE }
@@ -45,26 +50,32 @@ object SessionProbe {
     private val pending = ArrayList<() -> Unit>()
     private val main = Handler(Looper.getMainLooper())
 
-    private class Result(val physicalId: String?, val ok: Boolean, val frames: Int, val focal: Float?)
+    private class Spec(
+        val title: String,
+        val physicalId: String?,
+        val previewPrivate: Boolean = false,
+        val jpeg: Boolean = false,
+    )
+
+    private class Result(val spec: Spec, val ok: Boolean, val focal: Float?)
 
     /** À appeler depuis le thread principal. */
     fun ensureRun(context: Context, onDone: () -> Unit) {
         when (state) {
-            State.DONE -> { onDone(); return }
-            State.RUNNING -> { pending.add(onDone); return }
-            State.IDLE -> {}
+            State.DONE -> {
+                onDone()
+                return
+            }
+            State.RUNNING -> {
+                pending.add(onDone)
+                return
+            }
+            State.IDLE -> Unit
         }
         state = State.RUNNING
         pending.add(onDone)
         val app = context.applicationContext
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-
-        fun complete() {
-            state = State.DONE
-            val callbacks = ArrayList(pending)
-            pending.clear()
-            callbacks.forEach { it() }
-        }
 
         val saved = prefs.getString(KEY_RESULT, null)
         if (saved != null) {
@@ -88,19 +99,43 @@ object SessionProbe {
             complete()
             return
         }
-        val logicalFocal = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+        val logicalFocal =
+            characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
         // Capteurs physiques cachés = ceux qui ne sont pas aussi exposés comme caméra dorsale autonome
         val hidden = characteristics.physicalCameraIds.filter { it !in choice.allBackIds }.sorted()
-        val tests: List<String?> = listOf<String?>(null) + hidden
-        CameraDiagnostics.log("PROBE", "tests prévus sur id=${choice.cameraId} : ${tests.map { it ?: "logique" }}")
+        val phase1 = listOf(Spec("logique YUV", null)) + hidden.map { Spec("physique $it YUV", it) }
+        CameraDiagnostics.log("PROBE", "phase 1 sur id=${choice.cameraId} : ${phase1.map { it.title }}")
 
-        runTests(app, choice.cameraId, tests, 0, ArrayList()) { results ->
-            val decision = decide(results, logicalFocal)
-            CameraDiagnostics.log("PROBE_DECISION", decision)
-            prefs.edit().putString(KEY_RESULT, decision).apply()
-            applyResult(decision)
-            waitForCamera(app, choice.cameraId, 1500) { complete() }
+        runTests(app, choice.cameraId, phase1, 0, ArrayList()) { results1 ->
+            val decision = decide(results1, logicalFocal)
+            if (!decision.startsWith("PHYSICAL:")) {
+                conclude(app, prefs, choice.cameraId, decision)
+                return@runTests
+            }
+            val chosen = decision.removePrefix("PHYSICAL:")
+            val phase2 = listOf(
+                Spec("physique $chosen YUV + JPEG max", chosen, jpeg = true),
+                Spec("physique $chosen PRIVATE + JPEG max", chosen, previewPrivate = true, jpeg = true),
+            )
+            CameraDiagnostics.log("PROBE", "phase 2 : ${phase2.map { it.title }}")
+            runTests(app, choice.cameraId, phase2, 0, ArrayList()) {
+                conclude(app, prefs, choice.cameraId, decision)
+            }
         }
+    }
+
+    private fun complete() {
+        state = State.DONE
+        val callbacks = ArrayList(pending)
+        pending.clear()
+        callbacks.forEach { it() }
+    }
+
+    private fun conclude(app: Context, prefs: SharedPreferences, cameraId: String, decision: String) {
+        CameraDiagnostics.log("PROBE_DECISION", decision)
+        prefs.edit().putString(KEY_RESULT, decision).apply()
+        applyResult(decision)
+        waitForCamera(app, cameraId, 1500) { complete() }
     }
 
     private fun applyResult(result: String) {
@@ -110,34 +145,34 @@ object SessionProbe {
     }
 
     private fun decide(results: List<Result>, logicalFocal: Float?): String {
-        val logical = results.firstOrNull { it.physicalId == null }
+        val logical = results.firstOrNull { it.spec.physicalId == null }
         if (logical?.ok == true) return "LOGICAL_OK"
-        val okPhysical = results.filter { it.physicalId != null && it.ok }
+        val okPhysical = results.filter { it.spec.physicalId != null && it.ok }
         if (okPhysical.isEmpty()) return "NONE"
         var best: Result = okPhysical.first()
         if (logicalFocal != null) {
-            // le capteur principal est celui dont la focale réelle est la plus proche de celle de la caméra logique
+            // le capteur principal a la focale réelle la plus proche de celle de la caméra logique
             best = okPhysical.minByOrNull { abs((it.focal ?: 999f) - logicalFocal) } ?: best
         }
-        return "PHYSICAL:${best.physicalId}"
+        return "PHYSICAL:${best.spec.physicalId}"
     }
 
     private fun runTests(
         context: Context,
         cameraId: String,
-        tests: List<String?>,
+        specs: List<Spec>,
         index: Int,
         acc: MutableList<Result>,
         finished: (List<Result>) -> Unit,
     ) {
-        if (index >= tests.size) {
+        if (index >= specs.size) {
             finished(acc)
             return
         }
         waitForCamera(context, cameraId, if (index == 0) 0 else 1500) {
-            runOne(context, cameraId, tests[index]) { r ->
+            runOne(context, cameraId, specs[index]) { r ->
                 acc.add(r)
-                runTests(context, cameraId, tests, index + 1, acc, finished)
+                runTests(context, cameraId, specs, index + 1, acc, finished)
             }
         }
     }
@@ -156,17 +191,17 @@ object SessionProbe {
                 }
                 val ready = present && cameraId !in CameraDiagnostics.unavailableIds
                 if ((ready && elapsed >= minDelayMs) || elapsed > 12_000) {
-                    if (!ready) CameraDiagnostics.log("PROBE", "id=$cameraId toujours indisponible après ${elapsed} ms")
+                    if (!ready) CameraDiagnostics.log("PROBE", "id=$cameraId toujours indisponible après $elapsed ms")
                     onReady()
                 } else {
                     main.postDelayed(this, 250)
                 }
             }
         }
-        main.postDelayed(check, minDelayMs.coerceAtMost(250))
+        main.postDelayed(check, minDelayMs.coerceAtMost(250L))
     }
 
-    private fun pickSize(cm: CameraManager, id: String): Size {
+    private fun pickYuvSize(cm: CameraManager, id: String): Size {
         val sizes = try {
             cm.getCameraCharacteristics(id)
                 .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -179,35 +214,65 @@ object SessionProbe {
             ?: Size(640, 480)
     }
 
+    private fun pickPrivateSize(cm: CameraManager, id: String): Size {
+        val sizes = try {
+            cm.getCameraCharacteristics(id)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(SurfaceTexture::class.java)
+        } catch (e: Exception) {
+            null
+        }
+        return sizes?.firstOrNull { it.width == 1440 && it.height == 1080 }
+            ?: sizes?.firstOrNull { it.width == 1920 && it.height == 1080 }
+            ?: sizes?.firstOrNull { it.width <= 1920 }
+            ?: Size(1280, 720)
+    }
+
+    private fun pickJpegSize(cm: CameraManager, id: String): Size {
+        val sizes = try {
+            cm.getCameraCharacteristics(id)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(ImageFormat.JPEG)
+        } catch (e: Exception) {
+            null
+        }
+        return sizes?.maxByOrNull { it.width.toLong() * it.height } ?: Size(4000, 3000)
+    }
+
     @SuppressLint("MissingPermission")
-    private fun runOne(context: Context, cameraId: String, physicalId: String?, done: (Result) -> Unit) {
+    private fun runOne(context: Context, cameraId: String, spec: Spec, done: (Result) -> Unit) {
         val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val label = "id=$cameraId flux=${physicalId?.let { "physique $it" } ?: "logique"}"
+        val label = "id=$cameraId [${spec.title}]"
+        val physicalId = spec.physicalId
         val thread = HandlerThread("diag-session").also { it.start() }
         val handler = Handler(thread.looper)
         val executor = Executor { handler.post(it) }
         val finished = AtomicBoolean(false)
         val frames = AtomicInteger(0)
+        val jpegBytes = AtomicInteger(0)
         val focal = AtomicReference<Float?>(null)
         var device: CameraDevice? = null
         var session: CameraCaptureSession? = null
-        var reader: ImageReader? = null
+        var previewReader: ImageReader? = null
+        var jpegReader: ImageReader? = null
         val startNs = System.nanoTime()
         fun elapsedMs() = (System.nanoTime() - startNs) / 1_000_000
 
         fun finish(reason: String) {
             if (!finished.compareAndSet(false, true)) return
             handler.removeCallbacksAndMessages(null)
-            val ok = frames.get() >= MIN_FRAMES
+            val ok = frames.get() >= MIN_FRAMES && (!spec.jpeg || jpegBytes.get() > 0)
             CameraDiagnostics.log(
                 "SESSION_RESULT",
-                "$label : ${if (ok) "OK" else "ÉCHEC"} ($reason) images=${frames.get()} focale=${focal.get()} durée=${elapsedMs()} ms"
+                "$label : ${if (ok) "OK" else "ÉCHEC"} ($reason) images=${frames.get()} " +
+                    "jpegOctets=${jpegBytes.get()} focale=${focal.get()} durée=${elapsedMs()} ms"
             )
             try { session?.close() } catch (_: Exception) {}
             try { device?.close() } catch (_: Exception) {}
-            try { reader?.close() } catch (_: Exception) {}
+            try { previewReader?.close() } catch (_: Exception) {}
+            try { jpegReader?.close() } catch (_: Exception) {}
             thread.quitSafely()
-            val result = Result(physicalId, ok, frames.get(), focal.get())
+            val result = Result(spec, ok, focal.get())
             main.postDelayed({ done(result) }, 400)
         }
 
@@ -217,6 +282,13 @@ object SessionProbe {
                 request: CaptureRequest,
                 result: TotalCaptureResult,
             ) {
+                // les captures « still » ne comptent pas comme images d'aperçu
+                if (request.get(CaptureRequest.CONTROL_CAPTURE_INTENT) ==
+                    CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE
+                ) {
+                    CameraDiagnostics.log("SESSION_STILL", "$label : capture JPEG terminée après ${elapsedMs()} ms")
+                    return
+                }
                 val n = frames.incrementAndGet()
                 if (n == 1) {
                     val logicalFocal = result.get(CaptureResult.LENS_FOCAL_LENGTH)
@@ -240,35 +312,92 @@ object SessionProbe {
         }
 
         fun startSession(d: CameraDevice) {
-            val size = pickSize(cm, cameraId)
-            val r = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 3)
-            reader = r
-            r.setOnImageAvailableListener({ rd ->
+            val previewSize = if (spec.previewPrivate) pickPrivateSize(cm, cameraId) else pickYuvSize(cm, cameraId)
+            val pr = if (spec.previewPrivate) {
+                ImageReader.newInstance(
+                    previewSize.width, previewSize.height, ImageFormat.PRIVATE, 3,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE.toLong()
+                )
+            } else {
+                ImageReader.newInstance(previewSize.width, previewSize.height, ImageFormat.YUV_420_888, 3)
+            }
+            previewReader = pr
+            pr.setOnImageAvailableListener({ rd ->
                 try { rd.acquireLatestImage()?.close() } catch (_: Exception) {}
             }, handler)
-            val output = OutputConfiguration(r.surface)
-            if (physicalId != null) output.setPhysicalCameraId(physicalId)
-            CameraDiagnostics.log("SESSION", "$label : createCaptureSession ${size.width}x${size.height} YUV")
+
+            val outputs = ArrayList<OutputConfiguration>()
+            val previewOutput = OutputConfiguration(pr.surface)
+            if (physicalId != null) previewOutput.setPhysicalCameraId(physicalId)
+            outputs.add(previewOutput)
+
+            var jr: ImageReader? = null
+            var jpegSize: Size? = null
+            if (spec.jpeg) {
+                val js = pickJpegSize(cm, cameraId)
+                jpegSize = js
+                val reader = ImageReader.newInstance(js.width, js.height, ImageFormat.JPEG, 2)
+                jr = reader
+                jpegReader = reader
+                reader.setOnImageAvailableListener({ rd ->
+                    try {
+                        val image = rd.acquireLatestImage()
+                        if (image != null) {
+                            jpegBytes.set(image.planes[0].buffer.remaining())
+                            image.close()
+                        }
+                    } catch (_: Exception) {}
+                }, handler)
+                val jpegOutput = OutputConfiguration(reader.surface)
+                if (physicalId != null) jpegOutput.setPhysicalCameraId(physicalId)
+                outputs.add(jpegOutput)
+            }
+            val stillReader: ImageReader? = jr
+            CameraDiagnostics.log(
+                "SESSION",
+                "$label : createCaptureSession aperçu ${previewSize.width}x${previewSize.height}" +
+                    (if (jpegSize != null) " + JPEG ${jpegSize.width}x${jpegSize.height}" else "")
+            )
             try {
                 d.createCaptureSession(
                     SessionConfiguration(
                         SessionConfiguration.SESSION_REGULAR,
-                        listOf(output),
+                        outputs,
                         executor,
                         object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(s: CameraCaptureSession) {
-                                if (finished.get()) { s.close(); return }
+                                if (finished.get()) {
+                                    s.close()
+                                    return
+                                }
                                 session = s
                                 CameraDiagnostics.log("SESSION", "$label : onConfigured après ${elapsedMs()} ms")
                                 try {
                                     val builder = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                                    builder.addTarget(r.surface)
-                                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                                    builder.addTarget(pr.surface)
+                                    builder.set(
+                                        CaptureRequest.CONTROL_AF_MODE,
+                                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                                    )
                                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                                         builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
                                     }
                                     s.setRepeatingRequest(builder.build(), captureCallback, handler)
-                                    handler.postDelayed({ finish("fin du test") }, 2000)
+                                    if (stillReader != null) {
+                                        handler.postDelayed({
+                                            try {
+                                                val still = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                                                still.addTarget(stillReader.surface)
+                                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                                    still.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+                                                }
+                                                s.capture(still.build(), captureCallback, handler)
+                                            } catch (e: Exception) {
+                                                CameraDiagnostics.log("SESSION_EXCEPTION", "$label : capture JPEG", e)
+                                            }
+                                        }, 1000)
+                                    }
+                                    handler.postDelayed({ finish("fin du test") }, if (stillReader != null) 3500 else 2000)
                                 } catch (e: Exception) {
                                     CameraDiagnostics.log("SESSION_EXCEPTION", "$label : setRepeatingRequest", e)
                                     finish("exception setRepeatingRequest")
@@ -287,15 +416,23 @@ object SessionProbe {
             }
         }
 
-        handler.postDelayed({ finish("délai dépassé (8 s)") }, 8000)
+        handler.postDelayed({ finish("délai dépassé (10 s)") }, 10_000)
         CameraDiagnostics.log("SESSION", "$label : openCamera…")
         try {
             cm.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(d: CameraDevice) {
-                    if (finished.get()) { d.close(); return }
+                    if (finished.get()) {
+                        d.close()
+                        return
+                    }
                     device = d
                     CameraDiagnostics.log("SESSION", "$label : ouvert en ${elapsedMs()} ms")
-                    startSession(d)
+                    try {
+                        startSession(d)
+                    } catch (e: Exception) {
+                        CameraDiagnostics.log("SESSION_EXCEPTION", "$label : startSession", e)
+                        finish("exception startSession")
+                    }
                 }
 
                 override fun onDisconnected(d: CameraDevice) {
