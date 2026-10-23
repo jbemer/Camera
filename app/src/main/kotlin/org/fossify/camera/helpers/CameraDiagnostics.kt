@@ -48,6 +48,9 @@ object CameraDiagnostics {
     private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val availabilityRegistered = AtomicBoolean(false)
 
+    /** ID actuellement signalés indisponibles par le CameraService (mis à jour par callback). */
+    val unavailableIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     fun init(context: Context) {
         try {
             val dir = context.getExternalFilesDir(null) ?: context.filesDir
@@ -129,6 +132,19 @@ object CameraDiagnostics {
                     "maxDigitalZoom=${c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)} " +
                     "zoomRatioRange=$zoomRange"
             )
+            // Caméras physiques cachées derrière une caméra logique
+            for (physId in c.physicalCameraIds) {
+                try {
+                    val pc = cm.getCameraCharacteristics(physId)
+                    log(
+                        "ENUM_PHYS",
+                        "logique=$id physique=$physId focals=${pc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList()} " +
+                            "sensorMm=${pc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)}"
+                    )
+                } catch (e: Exception) {
+                    log("ENUM_PHYS", "logique=$id physique=$physId : caractéristiques inaccessibles (${e.javaClass.simpleName})")
+                }
+            }
         } catch (e: Exception) {
             log("ENUM_FAIL", "getCameraCharacteristics($id) a échoué : ${e.javaClass.simpleName}", e)
         }
@@ -139,10 +155,12 @@ object CameraDiagnostics {
         val thread = HandlerThread("diag-avail").also { it.start() }
         cm.registerAvailabilityCallback(object : CameraManager.AvailabilityCallback() {
             override fun onCameraAvailable(cameraId: String) {
+                unavailableIds.remove(cameraId)
                 log("AVAIL", "id=$cameraId disponible")
             }
 
             override fun onCameraUnavailable(cameraId: String) {
+                unavailableIds.add(cameraId)
                 log("AVAIL", "id=$cameraId indisponible (ouvert par un client, ou HAL en défaut)")
             }
         }, Handler(thread.looper))

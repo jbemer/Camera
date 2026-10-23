@@ -82,6 +82,7 @@ import org.fossify.camera.helpers.MediaOutputHelper
 import org.fossify.camera.helpers.MediaSizeStore
 import org.fossify.camera.helpers.MediaSoundHelper
 import org.fossify.camera.helpers.PinchToZoomOnScaleGestureListener
+import org.fossify.camera.helpers.SessionProbe
 import org.fossify.camera.helpers.SimpleLocationManager
 import org.fossify.camera.helpers.VideoQualityManager
 import org.fossify.camera.interfaces.MyPreview
@@ -193,19 +194,12 @@ class CameraXPreview(
     }
 
     private fun startCamera(switching: Boolean = false) {
-        if (CameraDiagnostics.RAW_OPEN_PROBE_ENABLED &&
-            !CameraDiagnostics.probeAlreadyRun &&
-            !isFrontCameraInUse()
-        ) {
-            CameraDiagnostics.probeAlreadyRun = true
-            val mainId = MainCameraResolver.resolve(activity)?.cameraId
-            if (mainId != null) {
-                // Ouverture Camera2 pure du capteur principal, puis démarrage normal de CameraX.
-                CameraDiagnostics.probeOpen(activity, mainId) { startCameraInternal(switching) }
-                return
-            }
+        if (isFrontCameraInUse()) {
+            startCameraInternal(switching)
+        } else {
+            // Test Camera2 pur (une seule fois, résultat mémorisé) avant de démarrer CameraX.
+            SessionProbe.ensureRun(activity) { startCameraInternal(switching) }
         }
-        startCameraInternal(switching)
     }
 
     private fun startCameraInternal(switching: Boolean) {

@@ -47,6 +47,17 @@ object MainCameraResolver {
     @Volatile
     private var cachedSelector: CameraSelector? = null
 
+    /** ID physique à demander derrière la caméra logique (résultat du test SessionProbe). */
+    @Volatile
+    var physicalOverride: String? = null
+        private set
+
+    fun setPhysicalOverride(id: String?) {
+        physicalOverride = id
+        cachedSelector = null
+        CameraDiagnostics.log("RESOLVE", "ID physique imposé à CameraX : $id")
+    }
+
     fun equivalentFocalLengthMm(c: CameraCharacteristics): Float? {
         val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
             ?: return null
@@ -167,7 +178,7 @@ object MainCameraResolver {
     fun backSelector(context: Context): CameraSelector? {
         cachedSelector?.let { return it }
         val choice = resolve(context) ?: return null
-        val selector = CameraSelector.Builder()
+        val builder = CameraSelector.Builder()
             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
             .addCameraFilter(CameraFilter { infos ->
                 val match = infos.filter { Camera2CameraInfo.from(it).cameraId == choice.cameraId }
@@ -178,7 +189,8 @@ object MainCameraResolver {
                     match
                 }
             })
-            .build()
+        physicalOverride?.let { builder.setPhysicalCameraId(it) }
+        val selector = builder.build()
         cachedSelector = selector
         return selector
     }
