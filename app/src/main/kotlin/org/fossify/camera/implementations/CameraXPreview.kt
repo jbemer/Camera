@@ -99,6 +99,9 @@ import org.fossify.commons.helpers.PERMISSION_ACCESS_FINE_LOCATION
 import org.fossify.commons.helpers.ensureBackgroundThread
 import kotlin.math.abs
 
+/** Délai minimal entre la fermeture complète de la caméra et sa réouverture. */
+private const val COLD_REBIND_DELAY_MS = 1200L
+
 class CameraXPreview(
     private val activity: BaseSimpleActivity,
     private val previewView: PreviewView,
@@ -205,13 +208,45 @@ class CameraXPreview(
         }
     }
 
+    /** Incrémenté à chaque démarrage : seul le plus récent a le droit de lier la caméra. */
+    private var startGeneration = 0
+
     private fun startCameraInternal(switching: Boolean) {
-        CameraDiagnostics.log("PROVIDER", "ProcessCameraProvider.getInstance() (switching=$switching)")
+        val gen = ++startGeneration
+        val currentProvider = cameraProvider
+        if (MainCameraResolver.physicalOverride != null && currentProvider != null && camera != null) {
+            // Sur ce téléphone, reconfigurer une caméra déjà ouverte fait planter le pilote caméra.
+            // On la ferme donc complètement et on laisse le pilote se stabiliser avant de la rouvrir.
+            CameraDiagnostics.log("PROVIDER", "fermeture complète avant reconfiguration (gen=$gen)")
+            try {
+                currentProvider.unbindAll()
+            } catch (e: Exception) {
+                CameraDiagnostics.log("PROVIDER_FAIL", "unbindAll", e)
+            }
+            camera = null
+            SessionProbe.waitUntilIdle(activity, COLD_REBIND_DELAY_MS) {
+                if (gen == startGeneration) {
+                    startCameraProvider(switching, gen)
+                } else {
+                    CameraDiagnostics.log("PROVIDER", "démarrage gen=$gen ignoré (remplacé par gen=$startGeneration)")
+                }
+            }
+            return
+        }
+        startCameraProvider(switching, gen)
+    }
+
+    private fun startCameraProvider(switching: Boolean, gen: Int) {
+        CameraDiagnostics.log("PROVIDER", "ProcessCameraProvider.getInstance() (switching=$switching, gen=$gen)")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(activity.applicationContext)
         cameraProviderFuture.addListener({
             var stage = "PROVIDER_FAIL"
             try {
                 val provider = cameraProviderFuture.get()
+                if (gen != startGeneration) {
+                    CameraDiagnostics.log("PROVIDER", "démarrage gen=$gen annulé (remplacé par gen=$startGeneration)")
+                    return@addListener
+                }
                 cameraProvider = provider
                 CameraDiagnostics.log("PROVIDER", "provider obtenu, caméras disponibles = ${provider.availableCameraInfos.size}")
                 stage = "QUALITIES_FAIL"
@@ -654,8 +689,10 @@ class CameraXPreview(
         }
 
         val mediaOutput = mediaOutputHelper.getImageMediaOutput()
+        CameraDiagnostics.log("ACTION", "photo demandée")
         imageCapture!!.takePicture(mainExecutor, object : OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
+                CameraDiagnostics.log("ACTION", "photo : image reçue ${image.width}x${image.height}")
                 listener.shutterAnimation()
                 playShutterSoundIfEnabled()
                 ensureBackgroundThread {
@@ -693,6 +730,11 @@ class CameraXPreview(
             }
 
             override fun onError(exception: ImageCaptureException) {
+                CameraDiagnostics.log(
+                    "ACTION_ERROR",
+                    "photo : code=${exception.imageCaptureError} ${exception.message}",
+                    exception
+                )
                 handleImageCaptureError(exception)
             }
         })
@@ -780,6 +822,7 @@ class CameraXPreview(
                 recordingState = recordEvent
                 when (recordEvent) {
                     is VideoRecordEvent.Start -> {
+                        CameraDiagnostics.log("ACTION", "enregistrement vidéo démarré")
                         listener.onVideoRecordingStarted()
                     }
 
@@ -788,6 +831,10 @@ class CameraXPreview(
                     }
 
                     is VideoRecordEvent.Finalize -> {
+                        CameraDiagnostics.log(
+                            "ACTION",
+                            "enregistrement vidéo terminé, erreur=${recordEvent.error} cause=${recordEvent.cause}"
+                        )
                         playStopVideoRecordingSoundIfEnabled()
                         listener.onVideoRecordingStopped()
                         if (recordEvent.hasError()) {

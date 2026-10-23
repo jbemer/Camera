@@ -201,6 +201,36 @@ object SessionProbe {
         main.postDelayed(check, minDelayMs.coerceAtMost(250L))
     }
 
+    /**
+     * Attend qu'aucune caméra ne soit signalée utilisée et que le CameraService réponde,
+     * au moins [minDelayMs] (max 8 s), puis appelle [onReady] sur le thread principal.
+     */
+    fun waitUntilIdle(context: Context, minDelayMs: Long, onReady: () -> Unit) {
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val start = SystemClock.elapsedRealtime()
+        val check = object : Runnable {
+            override fun run() {
+                val elapsed = SystemClock.elapsedRealtime() - start
+                val alive = try {
+                    cm.cameraIdList.isNotEmpty()
+                } catch (e: Exception) {
+                    false
+                }
+                val idle = alive && CameraDiagnostics.unavailableIds.isEmpty()
+                if ((idle && elapsed >= minDelayMs) || elapsed > 8_000) {
+                    CameraDiagnostics.log(
+                        "PROVIDER",
+                        "caméras ${if (idle) "libres" else "encore occupées"} après $elapsed ms, réouverture"
+                    )
+                    onReady()
+                } else {
+                    main.postDelayed(this, 150)
+                }
+            }
+        }
+        main.postDelayed(check, 150)
+    }
+
     private fun pickYuvSize(cm: CameraManager, id: String): Size {
         val sizes = try {
             cm.getCameraCharacteristics(id)
