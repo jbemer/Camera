@@ -22,6 +22,8 @@ import androidx.camera.core.DisplayOrientedMeteringPointFactory
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import android.graphics.drawable.BitmapDrawable
+import android.os.SystemClock
 import androidx.camera.core.ExtendableBuilder
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCapture.Builder
@@ -62,6 +64,7 @@ import androidx.core.view.doOnLayout
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.Observer
 import androidx.window.layout.WindowMetricsCalculator
 import com.bumptech.glide.load.ImageHeaderParser.UNKNOWN_ORIENTATION
 import org.fossify.camera.R
@@ -74,6 +77,7 @@ import org.fossify.camera.extensions.toCameraXQuality
 import org.fossify.camera.extensions.toLensFacing
 import org.fossify.camera.helpers.BitmapUtils
 import org.fossify.camera.helpers.CameraDiagnostics
+import org.fossify.camera.helpers.CameraIdleWaiter
 import org.fossify.camera.helpers.CameraErrorHandler
 import org.fossify.camera.helpers.FLASH_ALWAYS_ON
 import org.fossify.camera.helpers.FLASH_ON
@@ -85,7 +89,6 @@ import org.fossify.camera.helpers.MediaOutputHelper
 import org.fossify.camera.helpers.MediaSizeStore
 import org.fossify.camera.helpers.MediaSoundHelper
 import org.fossify.camera.helpers.PinchToZoomOnScaleGestureListener
-import org.fossify.camera.helpers.SessionProbe
 import org.fossify.camera.helpers.SimpleLocationManager
 import org.fossify.camera.helpers.VideoQualityManager
 import org.fossify.camera.interfaces.MyPreview
@@ -99,8 +102,11 @@ import org.fossify.commons.helpers.PERMISSION_ACCESS_FINE_LOCATION
 import org.fossify.commons.helpers.ensureBackgroundThread
 import kotlin.math.abs
 
-/** Délai minimal entre la fermeture complète de la caméra et sa réouverture. */
-private const val COLD_REBIND_DELAY_MS = 1200L
+/** Délai minimal entre la fermeture de la face arrière et la réouverture d'une caméra (cf. startCameraInternal). */
+private const val REAR_CLOSE_SETTLE_MS = 1500L
+
+/** Pause après la fermeture de la caméra avant : elle ne fait pas redémarrer le pilote. */
+private const val FRONT_CLOSE_SETTLE_MS = 300L
 
 class CameraXPreview(
     private val activity: BaseSimpleActivity,
@@ -200,40 +206,97 @@ class CameraXPreview(
     }
 
     private fun startCamera(switching: Boolean = false) {
-        if (isFrontCameraInUse()) {
-            startCameraInternal(switching)
-        } else {
-            // Test Camera2 pur (une seule fois, résultat mémorisé) avant de démarrer CameraX.
-            SessionProbe.ensureRun(activity) { startCameraInternal(switching) }
-        }
+        startCameraInternal(switching)
     }
 
     /** Incrémenté à chaque démarrage : seul le plus récent a le droit de lier la caméra. */
     private var startGeneration = 0
 
+    /** La dernière caméra liée était la face arrière pilotée par capteur physique. */
+    private var lastBoundRear = false
+
+    /** Instant (elapsedRealtime) de la dernière fermeture de la face arrière, 0 si jamais. */
+    private var lastRearClosedAt = 0L
+
+    private var previewFrozen = false
+
     private fun startCameraInternal(switching: Boolean) {
         val gen = ++startGeneration
+        val choice = MainCameraResolver.resolve(activity)
+        if (choice == null || choice.physicalId == null) {
+            startCameraProvider(switching, gen)
+            return
+        }
+
+        // Sur ce téléphone, reconfigurer une caméra déjà ouverte fait planter le pilote caméra, et
+        // fermer la face arrière le fait redémarrer environ 0,7 s plus tard (retour à la normale
+        // après ~2 s). On ferme donc complètement la caméra, puis on attend que le pilote soit
+        // stable avant de rouvrir.
+        val proceed = {
+            if (gen == startGeneration) startCameraProvider(switching, gen)
+        }
         val currentProvider = cameraProvider
-        if (MainCameraResolver.physicalOverride != null && currentProvider != null && camera != null) {
-            // Sur ce téléphone, reconfigurer une caméra déjà ouverte fait planter le pilote caméra.
-            // On la ferme donc complètement et on laisse le pilote se stabiliser avant de la rouvrir.
-            CameraDiagnostics.log("PROVIDER", "fermeture complète avant reconfiguration (gen=$gen)")
+        val hadCamera = currentProvider != null && camera != null
+        if (hadCamera) {
+            freezePreview()
             try {
-                currentProvider.unbindAll()
+                currentProvider?.unbindAll()
             } catch (e: Exception) {
                 CameraDiagnostics.log("PROVIDER_FAIL", "unbindAll", e)
             }
             camera = null
-            SessionProbe.waitUntilIdle(activity, COLD_REBIND_DELAY_MS) {
-                if (gen == startGeneration) {
-                    startCameraProvider(switching, gen)
-                } else {
-                    CameraDiagnostics.log("PROVIDER", "démarrage gen=$gen ignoré (remplacé par gen=$startGeneration)")
+            if (lastBoundRear) lastRearClosedAt = SystemClock.elapsedRealtime()
+        }
+        val ignored = choice.allBackIds - choice.cameraId
+        val remaining = if (lastRearClosedAt == 0L) {
+            0L
+        } else {
+            (REAR_CLOSE_SETTLE_MS - (SystemClock.elapsedRealtime() - lastRearClosedAt)).coerceAtLeast(0L)
+        }
+        when {
+            remaining > 0L -> CameraIdleWaiter.waitUntilIdle(activity, remaining, ignored, proceed)
+            hadCamera -> previewView.postDelayed({ proceed() }, FRONT_CLOSE_SETTLE_MS)
+            else -> CameraIdleWaiter.waitUntilIdle(activity, 0L, ignored, proceed)
+        }
+    }
+
+    /** Fige la dernière image pendant le changement de caméra, au lieu d'un écran noir. */
+    private fun freezePreview() {
+        if (previewFrozen) return
+        try {
+            if (previewView.previewStreamState.value != PreviewView.StreamState.STREAMING) return
+            val bitmap = previewView.bitmap ?: return
+            previewView.foreground = BitmapDrawable(activity.resources, bitmap)
+            previewFrozen = true
+        } catch (e: Throwable) {
+            CameraDiagnostics.log("FREEZE", "image figée impossible", e)
+        }
+    }
+
+    private fun unfreezePreview() {
+        if (!previewFrozen) return
+        previewFrozen = false
+        previewView.foreground = null
+    }
+
+    /** Retire l'image figée dès que le nouvel aperçu diffuse, ou au plus tard après 2,5 s. */
+    private fun scheduleUnfreeze() {
+        val thisGen = startGeneration
+        var sawIdle = false
+        val observer = object : Observer<PreviewView.StreamState> {
+            override fun onChanged(value: PreviewView.StreamState) {
+                if (value == PreviewView.StreamState.IDLE) sawIdle = true
+                if (value == PreviewView.StreamState.STREAMING && sawIdle) {
+                    previewView.previewStreamState.removeObserver(this)
+                    unfreezePreview()
                 }
             }
-            return
         }
-        startCameraProvider(switching, gen)
+        previewView.previewStreamState.observe(activity, observer)
+        previewView.postDelayed({
+            previewView.previewStreamState.removeObserver(observer)
+            if (thisGen == startGeneration) unfreezePreview()
+        }, 2500)
     }
 
     private fun startCameraProvider(switching: Boolean, gen: Int) {
@@ -255,7 +318,9 @@ class CameraXPreview(
                 stage = "BIND_FAIL"
                 bindCameraUseCases()
                 setupCameraObservers()
+                if (previewFrozen) scheduleUnfreeze()
             } catch (e: Exception) {
+                unfreezePreview()
                 CameraDiagnostics.log(stage, "échec : ${e.javaClass.simpleName}: ${e.message}", e)
                 val errorMessage =
                     if (switching) R.string.camera_switch_error else R.string.camera_open_error
@@ -291,6 +356,7 @@ class CameraXPreview(
 
         cameraProvider.unbindAll()
         val bindSelector = resolveBindSelector()
+        lastBoundRear = !isFrontCameraInUse() && MainCameraResolver.physicalCameraId(activity) != null
         CameraDiagnostics.log(
             "BIND",
             "bindToLifecycle, face=${if (isFrontCameraInUse()) "avant" else "arrière"}, " +
@@ -321,7 +387,6 @@ class CameraXPreview(
                 captureUseCase,
             )
         }
-        CameraDiagnostics.describeBoundCamera(camera)
         preview = previewUseCase
         setupZoomAndFocus()
         setFlashlightState(config.flashlightState)
@@ -342,7 +407,7 @@ class CameraXPreview(
      */
     @OptIn(ExperimentalCamera2Interop::class)
     private fun <T> applyPhysicalCamera(builder: ExtendableBuilder<T>) {
-        val id = MainCameraResolver.physicalOverride ?: return
+        val id = MainCameraResolver.physicalCameraId(activity) ?: return
         if (isFrontCameraInUse()) return
         CameraDiagnostics.log("BIND", "flux imposé au capteur physique $id")
         Camera2Interop.Extender(builder).setPhysicalCameraId(id)
@@ -561,6 +626,7 @@ class CameraXPreview(
     }
 
     override fun onStop(owner: LifecycleOwner) {
+        if (lastBoundRear) lastRearClosedAt = SystemClock.elapsedRealtime()
         orientationEventListener.disable()
     }
 

@@ -14,20 +14,18 @@ import kotlin.math.hypot
 
 data class MainCameraChoice(
     val cameraId: String,
-    val reason: String,
-    /** true si l'ID est une caméra logique (fusion de plusieurs capteurs) : voir limites. */
+    /** true si l'ID est une caméra logique (fusion de plusieurs capteurs). */
     val isLogicalMultiCamera: Boolean,
+    /** Capteur physique principal derrière la caméra logique, à demander seul au pilote. */
+    val physicalId: String?,
     /** Tous les ID dorsaux vus lors de l'énumération. */
     val allBackIds: Set<String>,
 )
 
 /**
- * Choisit l'ID Camera2 du capteur dorsal principal (grand-angle standard, zoom 1x) à partir de
- * l'équivalent 35 mm de la focale (f × 43,27 / diagonale du capteur), sans ouvrir aucune caméra :
- * seules les CameraCharacteristics sont lues.
- *
- * Valeurs typiques : ultra grand-angle ~12-15 mm, principal ~22-28 mm, téléobjectif > 50 mm.
- * Ces bornes sont une heuristique ; le journal ENUM_ID permet de les vérifier sur l'appareil.
+ * Choisit la caméra dorsale principale (grand-angle standard, zoom 1x) par l'équivalent 35 mm de sa
+ * focale. Si c'est une caméra logique, repère aussi le capteur physique principal (même focale et
+ * même taille de capteur que la caméra logique) pour ne jamais démarrer l'ultra grand-angle.
  */
 object MainCameraResolver {
     private const val TARGET_EQUIV_MM = 24f
@@ -35,7 +33,7 @@ object MainCameraResolver {
     private const val MAX_MAIN_EQUIV_MM = 32f
     private const val FULL_FRAME_DIAGONAL_MM = 43.267f
 
-    /** Pour forcer un ID (ex. "0") après lecture du journal ENUM_ID. null = heuristique. */
+    /** Pour forcer un ID de caméra dorsale (ex. "0"). null = détection automatique. */
     val FORCED_BACK_CAMERA_ID: String? = null
 
     @Volatile
@@ -46,17 +44,6 @@ object MainCameraResolver {
 
     @Volatile
     private var cachedSelector: CameraSelector? = null
-
-    /** ID physique à demander derrière la caméra logique (résultat du test SessionProbe). */
-    @Volatile
-    var physicalOverride: String? = null
-        private set
-
-    fun setPhysicalOverride(id: String?) {
-        physicalOverride = id
-        cachedSelector = null
-        CameraDiagnostics.log("RESOLVE", "ID physique imposé à CameraX : $id")
-    }
 
     fun equivalentFocalLengthMm(c: CameraCharacteristics): Float? {
         val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
@@ -83,6 +70,9 @@ object MainCameraResolver {
         }
     }
 
+    /** ID du capteur physique à imposer à tous les flux, ou null (comportement CameraX d'origine). */
+    fun physicalCameraId(context: Context): String? = resolve(context)?.physicalId
+
     private class Candidate(
         val id: String,
         val equiv: Float?,
@@ -95,7 +85,7 @@ object MainCameraResolver {
         val ids = try {
             cm.cameraIdList
         } catch (e: Exception) {
-            CameraDiagnostics.log("ENUM_FAIL", "getCameraIdList() a échoué (résolution)", e)
+            CameraDiagnostics.log("ENUM_FAIL", "getCameraIdList() a échoué", e)
             return null
         }
 
@@ -120,84 +110,86 @@ object MainCameraResolver {
                     )
                 )
             } catch (e: Exception) {
-                CameraDiagnostics.log("RESOLVE_SKIP", "id=$id illisible : ${e.javaClass.simpleName}", e)
+                CameraDiagnostics.log("RESOLVE_SKIP", "id=$id illisible", e)
             }
         }
         val allBack = candidates.map { it.id }.toSet()
-        CameraDiagnostics.log(
-            "RESOLVE",
-            "candidats dorsaux : " + candidates.joinToString {
-                "id=${it.id}(equiv=${it.equiv?.let { v -> "%.1f".format(v) }}, logical=${it.logical}, compat=${it.backwardCompatible})"
-            }
-        )
 
         val forced = FORCED_BACK_CAMERA_ID
-        if (forced != null) {
-            val c = candidates.firstOrNull { it.id == forced }
-            return if (c != null) {
-                MainCameraChoice(c.id, "forcé par FORCED_BACK_CAMERA_ID", c.logical, allBack)
-            } else {
-                CameraDiagnostics.log("RESOLVE", "ID forcé $forced absent des caméras dorsales")
-                null
-            }
-        }
-
-        val usable = candidates.filter { it.backwardCompatible }
-        val inRange = usable.filter { it.equiv != null && it.equiv in MIN_MAIN_EQUIV_MM..MAX_MAIN_EQUIV_MM }
-
-        val pick: Candidate?
-        val reason: String
-        if (inRange.isNotEmpty()) {
-            // plus proche de 24 mm ; à égalité on préfère une caméra non logique, puis l'ID le plus petit
-            pick = inRange.sortedWith(
-                compareBy<Candidate>({ Math.round(abs(it.equiv!! - TARGET_EQUIV_MM) * 2f) }, { it.logical })
-                    .thenBy { it.id.toIntOrNull() ?: Int.MAX_VALUE }
-            ).first()
-            reason = "équivalent 35 mm ${"%.1f".format(pick.equiv)} mm, le plus proche de $TARGET_EQUIV_MM"
+        val pick: Candidate? = if (forced != null) {
+            candidates.firstOrNull { it.id == forced }
         } else {
-            pick = usable.minByOrNull { it.id.toIntOrNull() ?: Int.MAX_VALUE }
-            reason = "repli : aucune focale dans la plage grand-angle standard, plus petit ID dorsal"
+            val usable = candidates.filter { it.backwardCompatible }
+            val inRange = usable.filter { it.equiv != null && it.equiv in MIN_MAIN_EQUIV_MM..MAX_MAIN_EQUIV_MM }
+            if (inRange.isNotEmpty()) {
+                inRange.sortedWith(
+                    compareBy<Candidate>({ Math.round(abs(it.equiv!! - TARGET_EQUIV_MM) * 2f) }, { it.logical })
+                        .thenBy { it.id.toIntOrNull() ?: Int.MAX_VALUE }
+                ).first()
+            } else {
+                usable.minByOrNull { it.id.toIntOrNull() ?: Int.MAX_VALUE }
+            }
         }
         if (pick == null) {
             CameraDiagnostics.log("RESOLVE", "aucune caméra dorsale utilisable")
             return null
         }
-        if (pick.logical) {
-            CameraDiagnostics.log(
-                "RESOLVE_WARN",
-                "id=${pick.id} est une caméra LOGIQUE : son ouverture peut alimenter d'autres capteurs " +
-                    "(ultra grand-angle inclus). Le contournement côté app est alors limité."
-            )
-        }
-        CameraDiagnostics.log("RESOLVE_OK", "capteur principal = id=${pick.id} ($reason)")
-        return MainCameraChoice(pick.id, reason, pick.logical, allBack)
+
+        val physical = if (pick.logical) findMainPhysicalId(cm, pick.id) else null
+        CameraDiagnostics.log(
+            "RESOLVE_OK",
+            "principal=id ${pick.id} (logique=${pick.logical}), capteur physique=$physical, dorsales=$allBack"
+        )
+        return MainCameraChoice(pick.id, pick.logical, physical, allBack)
     }
 
-    /** Sélecteur CameraX qui ne retient que le capteur dorsal principal. null => comportement d'origine. */
+    /**
+     * Capteur physique de la caméra logique dont la focale et la taille de capteur sont celles de la
+     * caméra logique elle-même : c'est le capteur principal.
+     */
+    private fun findMainPhysicalId(cm: CameraManager, logicalId: String): String? {
+        return try {
+            val logical = cm.getCameraCharacteristics(logicalId)
+            val focal = logical.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+                ?: return null
+            val sensor = logical.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            logical.physicalCameraIds.sorted().firstOrNull { physicalId ->
+                try {
+                    val pc = cm.getCameraCharacteristics(physicalId)
+                    val f = pc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+                    val s = pc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                    f != null && abs(f - focal) < 0.05f &&
+                        (sensor == null || s == null ||
+                            (abs(s.width - sensor.width) < 0.05f && abs(s.height - sensor.height) < 0.05f))
+                } catch (e: Exception) {
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            CameraDiagnostics.log("RESOLVE_FAIL", "capteur physique introuvable", e)
+            null
+        }
+    }
+
+    /** Sélecteur CameraX qui ne retient que la caméra dorsale principale. null => comportement d'origine. */
     @OptIn(ExperimentalCamera2Interop::class)
     fun backSelector(context: Context): CameraSelector? {
         cachedSelector?.let { return it }
         val choice = resolve(context) ?: return null
-        val builder = CameraSelector.Builder()
+        val selector = CameraSelector.Builder()
             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
             .addCameraFilter(CameraFilter { infos ->
                 val match = infos.filter { Camera2CameraInfo.from(it).cameraId == choice.cameraId }
-                if (match.isEmpty()) {
-                    CameraDiagnostics.log("BIND_WARN", "id=${choice.cameraId} absent de la liste CameraX, repli sur le comportement d'origine")
-                    infos
-                } else {
-                    match
-                }
+                if (match.isEmpty()) infos else match
             })
-        val selector = builder.build()
+            .build()
         cachedSelector = selector
         return selector
     }
 
     /**
-     * Utilisé comme « available cameras limiter » de CameraX : les caméras dorsales autres que le
-     * capteur principal ne sont pas déclarées à CameraX (ni liées, ni listées).
-     * Les caméras non dorsales (avant) sont conservées.
+     * « Available cameras limiter » de CameraX : les autres caméras dorsales (ultra grand-angle,
+     * téléobjectif) ne lui sont pas déclarées. Les caméras avant sont conservées.
      */
     @OptIn(ExperimentalCamera2Interop::class)
     fun limitAvailableCameras(context: Context, infos: List<CameraInfo>): List<CameraInfo> {
@@ -211,10 +203,6 @@ object MainCameraResolver {
                 it.lensFacing == CameraSelector.LENS_FACING_BACK &&
                     Camera2CameraInfo.from(it).cameraId == choice.cameraId
             }
-            CameraDiagnostics.log(
-                "PROVIDER",
-                "limiteur CameraX : ${infos.size} -> ${kept.size} caméras (principal conservé : $hasMain)"
-            )
             return if (hasMain) kept else infos
         } catch (e: Exception) {
             CameraDiagnostics.log("PROVIDER_FAIL", "limiteur en échec, aucune limitation appliquée", e)
