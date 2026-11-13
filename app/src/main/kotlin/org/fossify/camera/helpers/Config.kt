@@ -13,18 +13,21 @@ class Config(context: Context) : BaseConfig(context) {
         fun newInstance(context: Context) = Config(context)
     }
 
+    /** DCIM/Camera s'il existe (dossier de l'appareil photo Samsung), sinon DCIM. */
+    private fun defaultSaveFolder(): String {
+        val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+        val camera = File(dcim, "Camera")
+        return if (camera.isDirectory) camera.toString() else dcim.toString()
+    }
+
     var savePhotosFolder: String
         get(): String {
-            var path = prefs.getString(
-                SAVE_PHOTOS,
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM).toString()
-            )
-            if (!File(path).exists() || !File(path).isDirectory) {
-                path = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
-                    .toString()
+            var path = prefs.getString(SAVE_PHOTOS, defaultSaveFolder())
+            if (path == null || !File(path).exists() || !File(path).isDirectory) {
+                path = defaultSaveFolder()
                 savePhotosFolder = path
             }
-            return path!!
+            return path
         }
         set(path) = prefs.edit().putString(SAVE_PHOTOS, path).apply()
 
