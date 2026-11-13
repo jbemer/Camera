@@ -18,6 +18,19 @@ object CameraIdleWaiter {
     private val registered = AtomicBoolean(false)
     private val main = Handler(Looper.getMainLooper())
 
+    /**
+     * Instant (elapsedRealtime) de la dernière fermeture de la face arrière, 0 si jamais.
+     * Gardé au niveau du processus : il survit à la recréation de l'activité (quitter puis
+     * relancer l'app vite), ce qui évite de rouvrir pendant le redémarrage du pilote.
+     */
+    @Volatile
+    var lastRearClosedAt = 0L
+        private set
+
+    fun markRearClosed() {
+        lastRearClosedAt = SystemClock.elapsedRealtime()
+    }
+
     fun register(context: Context) {
         if (!registered.compareAndSet(false, true)) return
         val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
