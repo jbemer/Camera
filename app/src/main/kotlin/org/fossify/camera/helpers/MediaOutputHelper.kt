@@ -127,7 +127,8 @@ class MediaOutputHelper(
             put(MediaStore.MediaColumns.DISPLAY_NAME, getRandomMediaName(isPhoto))
             put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
             if (isQPlus()) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM)
+                // Chemin de secours : DCIM/Camera, comme l'appareil photo Samsung.
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DCIM}/Camera")
             } else {
                 put(
                     MediaStore.MediaColumns.DATA,
