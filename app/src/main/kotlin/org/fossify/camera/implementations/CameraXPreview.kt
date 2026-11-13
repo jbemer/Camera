@@ -215,9 +215,6 @@ class CameraXPreview(
     /** La dernière caméra liée était la face arrière pilotée par capteur physique. */
     private var lastBoundRear = false
 
-    /** Instant (elapsedRealtime) de la dernière fermeture de la face arrière, 0 si jamais. */
-    private var lastRearClosedAt = 0L
-
     private var previewFrozen = false
 
     private fun startCameraInternal(switching: Boolean) {
@@ -233,11 +230,20 @@ class CameraXPreview(
         // après ~2 s). On ferme donc complètement la caméra, puis on attend que le pilote soit
         // stable avant de rouvrir.
         val proceed = {
-            if (gen == startGeneration) startCameraProvider(switching, gen)
+            // Si l'activité est passée en arrière-plan pendant l'attente, onStart relancera la caméra.
+            if (gen == startGeneration &&
+                activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            ) {
+                startCameraProvider(switching, gen)
+            }
         }
         val currentProvider = cameraProvider
         val hadCamera = currentProvider != null && camera != null
         if (hadCamera) {
+            // Caméra déjà fermée par onStop (retour d'arrière-plan) : la fermeture date d'onStop,
+            // il ne faut pas repartir pour 1,5 s d'attente.
+            val stateType = camera?.cameraInfo?.cameraState?.value?.type
+            val wasOpen = stateType != CameraState.Type.CLOSED
             freezePreview()
             try {
                 currentProvider?.unbindAll()
@@ -245,9 +251,10 @@ class CameraXPreview(
                 CameraDiagnostics.log("PROVIDER_FAIL", "unbindAll", e)
             }
             camera = null
-            if (lastBoundRear) lastRearClosedAt = SystemClock.elapsedRealtime()
+            if (lastBoundRear && wasOpen) CameraIdleWaiter.markRearClosed()
         }
         val ignored = choice.allBackIds - choice.cameraId
+        val lastRearClosedAt = CameraIdleWaiter.lastRearClosedAt
         val remaining = if (lastRearClosedAt == 0L) {
             0L
         } else {
@@ -626,7 +633,10 @@ class CameraXPreview(
     }
 
     override fun onStop(owner: LifecycleOwner) {
-        if (lastBoundRear) lastRearClosedAt = SystemClock.elapsedRealtime()
+        // Annule un démarrage encore en attente : onStart en relancera un.
+        startGeneration++
+        // CameraX ferme la caméra à l'arrêt de l'activité.
+        if (lastBoundRear && camera != null) CameraIdleWaiter.markRearClosed()
         orientationEventListener.disable()
     }
 
